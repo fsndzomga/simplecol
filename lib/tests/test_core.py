@@ -1,4 +1,6 @@
 import os
+import json
+import struct
 import pytest
 from lib.core import ColumnarWriter, ColumnarReader
 
@@ -18,23 +20,45 @@ def sample_data():
     }
 
 def test_write_read(tmp_path, sample_data):
-    # Test writing and reading
-    test_dir = tmp_path / "test_data"
-    ColumnarWriter.write(str(test_dir), sample_data["columns"], sample_data["schema"])
+    # Write to a single .col file
+    test_file = tmp_path / "test.col"
+    ColumnarWriter.write(str(test_file), sample_data["columns"], sample_data["schema"])
 
-    reader = ColumnarReader(str(test_dir))
+    # Verify file existence
+    assert os.path.exists(test_file)
+
+    # Read back data
+    reader = ColumnarReader(str(test_file))
     assert reader.num_rows == 3
 
-    # Test column reading
+    # Validate all columns
     assert reader.read_column("id") == [1, 2, 3]
     assert reader.read_column("name") == ["Alice", "Bob", "Charlie"]
-    assert reader.read_column("score") == [85.5, 92.3, 78.9]
+    assert reader.read_column("score") == pytest.approx([85.5, 92.3, 78.9])
 
-def test_metadata(tmp_path, sample_data):
-    test_dir = tmp_path / "test_meta"
-    ColumnarWriter.write(str(test_dir), sample_data["columns"], sample_data["schema"])
+def test_metadata_structure(tmp_path, sample_data):
+    test_file = tmp_path / "meta_test.col"
+    ColumnarWriter.write(str(test_file), sample_data["columns"], sample_data["schema"])
 
-    assert os.path.exists(os.path.join(test_dir, "_metadata.json"))
-    assert os.path.exists(os.path.join(test_dir, "id.bin"))
-    assert os.path.exists(os.path.join(test_dir, "name.bin"))
-    assert os.path.exists(os.path.join(test_dir, "score.bin"))
+    # Directly inspect the binary file structure
+    with open(test_file, "rb") as f:
+        # Read metadata length header
+        metadata_length = struct.unpack("<I", f.read(4))[0]
+
+        # Read and parse metadata
+        metadata_json = json.loads(f.read(metadata_length))
+
+        # Validate metadata content
+        assert metadata_json["num_rows"] == 3
+        assert metadata_json["schema"] == sample_data["schema"]
+
+        # Check column entries in metadata
+        assert {col["name"] for col in metadata_json["columns"]} == {"id", "name", "score"}
+        for col in metadata_json["columns"]:
+            assert col["type"] == sample_data["schema"][col["name"]]
+            assert "length" in col  # Verify binary data length is stored
+
+        # Verify total data size matches expectations
+        expected_data_size = sum(col["length"] for col in metadata_json["columns"])
+        actual_data_size = os.path.getsize(test_file) - (4 + metadata_length)
+        assert actual_data_size == expected_data_size
