@@ -1,3 +1,4 @@
+import zlib
 import json
 import struct
 from typing import Dict, List, Any
@@ -31,11 +32,15 @@ class ColumnarWriter:
                 else:
                     raise ValueError(f"Unsupported type: {col_type}")
 
-            column_binaries.append(bytes(binary_data))
+            # Compress the binary data
+            compressed_data = zlib.compress(bytes(binary_data))
+            column_binaries.append(compressed_data)
             ordered_columns.append({
                 "name": col_name,
                 "type": col_type,
-                "length": len(binary_data)
+                "length": len(compressed_data),
+                "original_length": len(binary_data),
+                "compression": "zlib"
             })
 
         # Prepare metadata
@@ -55,7 +60,7 @@ class ColumnarWriter:
             f.write(struct.pack('<I', metadata_length))
             # Write metadata JSON
             f.write(metadata_json)
-            # Write each column's binary data in order
+            # Write each column's compressed binary data in order
             for binary in column_binaries:
                 f.write(binary)
 
@@ -64,17 +69,10 @@ class ColumnarReader:
         self.filename = filename
         with open(filename, 'rb') as f:
             # Read metadata length
-            metadata_length_bytes = f.read(4)
-            if len(metadata_length_bytes) != 4:
-                raise ValueError("Invalid file format: metadata length missing")
-            metadata_length = struct.unpack('<I', metadata_length_bytes)[0]
-
+            metadata_length = struct.unpack('<I', f.read(4))[0]
             # Read metadata JSON
             metadata_json = f.read(metadata_length)
-            if len(metadata_json) != metadata_length:
-                raise ValueError("Invalid file format: incomplete metadata")
             self.metadata = json.loads(metadata_json)
-
             # Calculate start position of column data
             self.columns_start = 4 + metadata_length
 
@@ -89,52 +87,38 @@ class ColumnarReader:
 
     def read_column(self, col_name: str) -> List[Any]:
         # Find the column's index and info
-        col_index = None
-        col_info = None
-        for idx, col in enumerate(self.metadata['columns']):
-            if col['name'] == col_name:
-                col_index = idx
-                col_info = col
-                break
-        if col_info is None:
-            raise ValueError(f"Column '{col_name}' not found")
-
+        col_info = next(c for c in self.metadata['columns'] if c['name'] == col_name)
         col_type = col_info['type']
         col_length = col_info['length']
-        col_offset = self.column_offsets[col_index]
+        col_offset = self.column_offsets[self.metadata['columns'].index(col_info)]
 
-        # Read the column's binary data
+        # Read the column's compressed binary data
         with open(self.filename, 'rb') as f:
             f.seek(col_offset)
-            data_bytes = f.read(col_length)
+            compressed_data = f.read(col_length)
 
+        # Decompress the data
+        binary_data = zlib.decompress(compressed_data)
+
+        # Parse the binary data
         data = []
         if col_type == 'int':
-            num_values = col_length // 4
+            num_values = col_info['original_length'] // 4
             fmt = '<' + ('i' * num_values)
-            data = list(struct.unpack(fmt, data_bytes))
+            data = list(struct.unpack(fmt, binary_data))
         elif col_type == 'float':
-            num_values = col_length // 8
+            num_values = col_info['original_length'] // 8
             fmt = '<' + ('d' * num_values)
-            data = list(struct.unpack(fmt, data_bytes))
+            data = list(struct.unpack(fmt, binary_data))
         elif col_type == 'string':
             ptr = 0
-            while ptr < col_length:
-                # Read string length
-                if ptr + 4 > col_length:
-                    break
-                str_len = struct.unpack('<I', data_bytes[ptr:ptr+4])[0]
+            while ptr < col_info['original_length']:
+                str_len = struct.unpack('<I', binary_data[ptr:ptr+4])[0]
                 ptr += 4
-                # Read string
-                if ptr + str_len > col_length:
-                    break
-                s = data_bytes[ptr:ptr+str_len].decode('utf-8')
+                s = binary_data[ptr:ptr+str_len].decode('utf-8')
                 data.append(s)
                 ptr += str_len
         else:
             raise ValueError(f"Unsupported column type: {col_type}")
-
-        if len(data) != self.num_rows:
-            raise ValueError(f"Column '{col_name}' has {len(data)} rows, expected {self.num_rows}")
 
         return data
